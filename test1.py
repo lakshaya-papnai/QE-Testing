@@ -1,5 +1,6 @@
 import logging
 import sys
+import os
 from pyspark.sql.functions import col, lit, sum as _sum, avg, current_date
 from pyspark.sql.types import StructType, StructField, IntegerType, StringType, DoubleType, DateType
 
@@ -24,9 +25,35 @@ logger.propagate = False
 # 2 = Compute Crash (Massive Cross Join) [Killed / OOM]
 # 3 = Positional Schema Mismatch [CAST_INVALID_INPUT]
 # 4 = Schema Drift / Missing Column [UNRESOLVED_COLUMN]
-ERROR_MODE = 1 
+#
+# ERROR_MODE is sourced from a Databricks widget (EXECUTION_MODE) at runtime,
+# falling back to the EXECUTION_MODE environment variable, then defaulting to 1.
+# Register 'EXECUTION_MODE' as a job parameter in the Databricks Jobs UI
+# with valid values 1-4 before scheduling this pipeline.
+try:
+    ERROR_MODE = int(dbutils.widgets.get("EXECUTION_MODE"))
+except Exception:
+    ERROR_MODE = int(os.environ.get("EXECUTION_MODE", "1"))
 
 logger.info(f"Initializing Unified Chaos Pipeline (Running ERROR_MODE: {ERROR_MODE})...")
+
+# ==========================================
+# PRE-FLIGHT: Define required reference paths per mode
+# ==========================================
+TAX_FILE_PATH = "dbfs:/mnt/reference_data/regional_tax_rates_2026.csv"
+
+def assert_dbfs_path_exists(path: str) -> None:
+    """Raise a descriptive FileNotFoundError if the given DBFS path does not exist.
+    Uses dbutils.fs.ls() which is available on all Databricks clusters.
+    """
+    try:
+        dbutils.fs.ls(path)
+    except Exception:
+        raise FileNotFoundError(
+            f"Required reference file not found at '{path}'. "
+            "Ensure the file has been uploaded to the DBFS mount by the "
+            "Data Engineering team before re-running this pipeline mode."
+        )
 
 try:
     # ==========================================
@@ -76,19 +103,28 @@ try:
     if ERROR_MODE == 1:
         logger.info("Triggering Mode 1: Storage Trap (Missing Lookup File)...")
         
-        # Valid ETL logic
-        enriched_orders = orders_df.join(customers_df, "customer_id", "inner") \
-                                   .join(products_df, "product_id", "inner") \
-                                   .withColumn("total_revenue", col("qty") * col("price")) \
-                                   .filter(col("total_revenue") > 1000)
-                                   
-        # Trap: Pipeline does all the heavy lifting, then tries to enrich with a missing file
-        logger.info("Attempting to load regional tax lookup table...")
-        tax_rates_df = spark.read.format("csv").option("header", "true") \
-                            .load("dbfs:/mnt/reference_data/regional_tax_rates_2026.csv")
-                            
-        final_df = enriched_orders.join(tax_rates_df, "region", "left")
-        display(final_df)
+        try:
+            # Valid ETL logic
+            enriched_orders = orders_df.join(customers_df, "customer_id", "inner") \
+                                       .join(products_df, "product_id", "inner") \
+                                       .withColumn("total_revenue", col("qty") * col("price")) \
+                                       .filter(col("total_revenue") > 1000)
+                                       
+            # Pre-flight check: verify the tax rates file exists on DBFS before
+            # attempting to read it, so we get a clear actionable error rather
+            # than a raw AnalysisException (SQLSTATE 42K03) mid-execution.
+            logger.info("Verifying regional tax lookup table exists at: %s", TAX_FILE_PATH)
+            assert_dbfs_path_exists(TAX_FILE_PATH)
+
+            logger.info("Loading regional tax lookup table...")
+            tax_rates_df = spark.read.option("header", "true").csv(TAX_FILE_PATH)
+                                
+            final_df = enriched_orders.join(tax_rates_df, "region", "left")
+            display(final_df)
+
+        except FileNotFoundError as e:
+            logger.error("Mode 1 aborted — missing reference data: %s", str(e))
+            raise
 
 
     elif ERROR_MODE == 2:
