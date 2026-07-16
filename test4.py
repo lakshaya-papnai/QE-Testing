@@ -69,6 +69,11 @@ try:
         (5004, 103, 1, 2)
     ], schema=orders_schema)
 
+    # Log Bronze layer schemas for operational telemetry and early schema-drift detection
+    logger.info(f"Customers schema entering Mode {ERROR_MODE}: {customers_df.dtypes}")
+    logger.info(f"Products schema entering Mode {ERROR_MODE}: {products_df.dtypes}")
+    logger.info(f"Orders schema entering Mode {ERROR_MODE}: {orders_df.dtypes}")
+
     # ==========================================
     # 3. ERROR BRANCHING LOGIC (Silver/Gold Layers)
     # ==========================================
@@ -149,15 +154,28 @@ try:
         
         # Trap Setup: Upstream silently renames 'qty' to 'order_quantity'
         drifted_orders_df = orders_df.withColumnRenamed("qty", "order_quantity")
-        
-        # Lengthy downstream logic that rigidly expects the old 'qty' column
+
+        # FIX: Normalize the upstream column name 'order_quantity' back to the canonical
+        # Bronze-layer contract name 'qty' at the Bronze/Silver boundary.
+        # The Runbook documents that the upstream source system uses 'order_quantity'
+        # as the quantity column name. We rename it here so all downstream Silver/Gold
+        # transformations remain consistent with the shared Bronze schema contract.
+        logger.info("Normalizing upstream schema: renaming 'order_quantity' -> 'qty' at Bronze/Silver boundary...")
+        drifted_orders_df = drifted_orders_df.withColumnRenamed("order_quantity", "qty")
+
+        # Bronze-layer schema contract enforcement: assert 'qty' is present before proceeding
+        assert "qty" in drifted_orders_df.columns, \
+            f"Schema contract violation: expected 'qty', found: {drifted_orders_df.columns}"
+        logger.info(f"Orders schema after normalization (Mode {ERROR_MODE}): {drifted_orders_df.dtypes}")
+
+        # Lengthy downstream logic that rigidly expects the canonical 'qty' column
         logger.info("Enriching orders with customer and product hierarchies...")
         silver_df = drifted_orders_df.join(customers_df, "customer_id", "inner") \
                                      .join(products_df, "product_id", "inner") \
                                      .filter(col("region").isin("NA", "EMEA"))
                                      
         logger.info("Calculating final financial metrics...")
-        # Crashes here: [UNRESOLVED_COLUMN] Cannot resolve 'qty'
+        # Uses canonical 'qty' column — resolves correctly after the rename above
         gold_df = silver_df.withColumn("gross_margin", (col("qty") * col("price")) * lit(0.85)) \
                            .groupBy("customer_id", "name") \
                            .agg(_sum("gross_margin").alias("total_margin"))
