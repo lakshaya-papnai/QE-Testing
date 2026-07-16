@@ -1,4 +1,5 @@
 import logging
+import os
 import sys
 from pyspark.sql.functions import col, lit, sum as _sum, avg, current_date
 from pyspark.sql.types import StructType, StructField, IntegerType, StringType, DoubleType, DateType
@@ -24,9 +25,57 @@ logger.propagate = False
 # 2 = Compute Crash (Massive Cross Join) [Killed / OOM]
 # 3 = Positional Schema Mismatch [CAST_INVALID_INPUT]
 # 4 = Schema Drift / Missing Column [UNRESOLVED_COLUMN]
-ERROR_MODE = 1 
+#
+# ERROR_MODE is read from the EXECUTION_MODE environment variable
+# (set via Databricks Job configuration) to prevent hardcoded values
+# from accidentally reaching production. Defaults to 1 if not set.
+ERROR_MODE = int(os.environ.get('EXECUTION_MODE', 1))
 
 logger.info(f"Initializing Unified Chaos Pipeline (Running ERROR_MODE: {ERROR_MODE})...")
+
+# ==========================================
+# HELPER: Fault-tolerant tax rate loader
+# ==========================================
+TAX_FILE_PATH = 'dbfs:/mnt/reference_data/regional_tax_rates_2026.csv'
+
+def read_tax_rates_with_fallback(spark, path):
+    """
+    Attempt to read the regional tax rate CSV from DBFS.
+    Uses dbutils.fs.ls() as a pre-validation guard (Databricks-idiomatic)
+    before triggering a distributed Spark read. If the file is missing
+    (unmounted path, Cloud Ops rename, missing annual upload, etc.),
+    logs a warning and returns a fallback DataFrame with 0% tax rates
+    so the pipeline can continue without crashing.
+    """
+    try:
+        # Pre-validate path existence using Databricks dbutils before
+        # issuing a distributed Spark read — converts hard crash to
+        # graceful degradation per runbook guidance.
+        dbutils.fs.ls(path)
+        logger.info(f"Tax rate file found at {path}. Reading...")
+        tax_rates_df = (
+            spark.read
+                 .option('header', 'true')
+                 .option('inferSchema', 'true')
+                 .csv(path)
+        )
+        return tax_rates_df
+    except Exception as e:
+        logger.warning(
+            "[PATH_NOT_FOUND] Tax rate file missing at %s. "
+            "Falling back to default 0%% tax rate. Error: %s",
+            path, str(e)
+        )
+        # Fallback schema matches expected CSV structure
+        fallback_schema = StructType([
+            StructField('region', StringType(), True),
+            StructField('tax_rate', DoubleType(), True)
+        ])
+        return spark.createDataFrame(
+            [('NA', 0.0), ('EMEA', 0.0), ('APAC', 0.0)],
+            schema=fallback_schema
+        )
+
 
 try:
     # ==========================================
@@ -77,15 +126,19 @@ try:
         logger.info("Triggering Mode 1: Storage Trap (Missing Lookup File)...")
         
         # Valid ETL logic
-        enriched_orders = orders_df.join(customers_df, "customer_id", "inner") \
-                                   .join(products_df, "product_id", "inner") \
-                                   .withColumn("total_revenue", col("qty") * col("price")) \
-                                   .filter(col("total_revenue") > 1000)
+        enriched_orders = (
+            orders_df
+                .join(customers_df, "customer_id", "inner")
+                .join(products_df, "product_id", "inner")
+                .withColumn("total_revenue", col("qty") * col("price"))
+                .filter(col("total_revenue") > 1000)
+        )
                                    
-        # Trap: Pipeline does all the heavy lifting, then tries to enrich with a missing file
+        # Fault-tolerant load: uses dbutils.fs.ls() guard + fallback DataFrame
+        # so the pipeline degrades gracefully if the annual tax file is absent
+        # instead of crashing with PATH_NOT_FOUND.
         logger.info("Attempting to load regional tax lookup table...")
-        tax_rates_df = spark.read.format("csv").option("header", "true") \
-                            .load("dbfs:/mnt/reference_data/regional_tax_rates_2026.csv")
+        tax_rates_df = read_tax_rates_with_fallback(spark, TAX_FILE_PATH)
                             
         final_df = enriched_orders.join(tax_rates_df, "region", "left")
         display(final_df)
