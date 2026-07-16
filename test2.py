@@ -24,7 +24,7 @@ logger.propagate = False
 # 2 = Compute Crash (Massive Cross Join) [Killed / OOM]
 # 3 = Positional Schema Mismatch [CAST_INVALID_INPUT]
 # 4 = Schema Drift / Missing Column [UNRESOLVED_COLUMN]
-ERROR_MODE = 1 
+ERROR_MODE = 2
 
 logger.info(f"Initializing Unified Chaos Pipeline (Running ERROR_MODE: {ERROR_MODE})...")
 
