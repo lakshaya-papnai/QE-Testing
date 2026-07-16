@@ -1,0 +1,58 @@
+import logging
+import sys
+from pyspark.sql.functions import col
+
+# ==========================================
+# 0. DATABRICKS-SAFE LOGGING SETUP
+# ==========================================
+logger = logging.getLogger("ChaosPipelineETL")
+logger.setLevel(logging.INFO)
+
+if not logger.handlers:
+    stream_handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    stream_handler.setFormatter(formatter)
+    logger.addHandler(stream_handler)
+
+logger.propagate = False
+logger.info("Initializing Chaos Pipeline 1: Ghost in the Machine...")
+
+try:
+    # ==========================================
+    # 1. BRONZE LAYER (Extraction & Storage Trap)
+    # ==========================================
+    logger.info("Extracting Bronze data...")
+    
+    # INTENTIONAL ERROR 1 (Storage): 
+    # Path does not exist. Throws AnalysisException: [PATH_NOT_FOUND]
+    df_bronze = spark.read.format("csv").option("header", "true").load("/mnt/legacy_storage/abandoned_sales_data.csv")
+
+    # ==========================================
+    # 2. SILVER LAYER (Compute & Memory Trap)
+    # ==========================================
+    logger.info("Applying Silver layer logic...")
+    
+    # Artificially lowering driver memory limit to guarantee the trap springs
+    spark.conf.set("spark.driver.maxResultSize", "1m") 
+    
+    # INTENTIONAL ERROR 2 (Compute): 
+    # Naive developer attempts to bring all data to the driver. 
+    # Throws SparkException: Job aborted due to stage failure: Total size of serialized results is bigger than spark.driver.maxResultSize
+    local_driver_data = df_bronze.collect()
+
+    # ==========================================
+    # 3. GOLD LAYER (Schema Trap)
+    # ==========================================
+    logger.info("Writing to Gold layer...")
+    
+    # INTENTIONAL ERROR 3 (Schema): 
+    # Downstream table expects 'client_id', but the source data (hypothetically) only has 'customer_id'.
+    # Throws AnalysisException: [UNRESOLVED_COLUMN]
+    df_gold = df_bronze.select("client_id", "transaction_date", "total_amount")
+    
+    logger.info("Pipeline completed successfully.")
+    display(df_gold)
+
+except Exception as e:
+    logger.error("Pipeline failed during execution. Error details: %s", str(e))
+    raise
