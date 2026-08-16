@@ -1,35 +1,47 @@
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col
+from pyspark.sql.functions import col, udf
+from pyspark.sql.types import StructType, StructField, StringType, FloatType
 
-def process_customer_data(spark: SparkSession):
-    # Load current month's active customers
-    df_current = spark.createDataFrame([
-        (1, "Alice", "alice@example.com", 1500.50),
-        (2, "Bob", "bob@example.com", 200.00)
-    ], ["customer_id", "name", "email", "lifetime_value"])
 
-    # Load legacy archived customers (Schema differs: lifetime_value is missing, phone is added)
-    df_archived = spark.createDataFrame([
-        (3, "Charlie", "charlie@example.com", "555-1234"),
-        (4, "Diana", "diana@example.com", "555-5678")
-    ], ["customer_id", "name", "email", "phone"])
+risk_schema = StructType([
+    StructField("risk_label", StringType(), True),
+    StructField("risk_score", FloatType(), True),
+])
+@udf(returnType=risk_schema)
+def classify_risk(order_value):
+    if order_value is None:
+        return None
+    if order_value > 1000:
+        return ("HIGH", 0.9)   
+    elif order_value > 300:
+        return ("MEDIUM", 0.5)
+    else:
+        return ("LOW", 0.1)
 
-    # Combine current and archived customers for full reporting
-    # BUG: using union() instead of unionByName(allowMissingColumns=True)
-    # This will cause an AnalysisException because schemas don't match exactly.
-    df_combined = df_current.union(df_archived)
 
-    # Calculate some metrics
-    df_summary = df_combined.groupBy("customer_id").count()
-    
-    return df_summary
+def run_risk_classification(spark: SparkSession):
+    df = spark.createDataFrame([
+        (1, "order-A", 1500.0),
+        (2, "order-B", 450.0),
+        (3, "order-C", 80.0),
+    ], ["customer_id", "order_id", "order_value"])
+
+    df_classified = df.withColumn("risk", classify_risk(col("order_value")))
+    df_final = df_classified.select(
+        "customer_id", "order_id", "order_value",
+        col("risk.risk_label").alias("risk_label"),
+        col("risk.risk_score").alias("risk_score"),
+    )
+
+    return df_final
+
 
 if __name__ == "__main__":
-    spark = SparkSession.builder.appName("CustomerDataProcessor").getOrCreate()
+    spark = SparkSession.builder.appName("RiskClassificationPipeline").getOrCreate()
     try:
-        result = process_customer_data(spark)
+        result = run_risk_classification(spark)
         result.show()
     except Exception as e:
-        print(f"Error processing data: {e}")
+        print(f"Error: {e}")
     finally:
         spark.stop()
