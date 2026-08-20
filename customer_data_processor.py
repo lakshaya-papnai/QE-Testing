@@ -1,68 +1,150 @@
-# 1. Overview
+import logging
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StructType, StructField, LongType, StringType, IntegerType
 
-**Purpose:** Run and validate the Customer Demographics ETL in Databricks.
+# ---------------------------------------------------------------------------
+# Logging setup
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("CustomerDemographicsETL")
 
-**Flow:**
-`Bronze → Silver → Gold`
+# ---------------------------------------------------------------------------
+# SparkSession — local mode with fast failure on deterministic errors
+# ---------------------------------------------------------------------------
+spark = (
+    SparkSession.builder
+    .master("local[*]")
+    .appName("CustomerDemographicsETL")
+    .config("spark.task.maxFailures", "1")
+    .getOrCreate()
+)
+spark.sparkContext.setLogLevel("ERROR")
 
-* **Bronze:** Creates two customer datasets with explicit schemas.
-* **Silver:** Removes records where `age < 0`.
-* **Gold:** Combines the cleaned datasets.
-* **Logging:** Tracks initialization, processing stages, success, and failures.
 
-**Prerequisites**
+def run_pipeline() -> None:
+    """
+    Execute the Customer Demographics ETL pipeline.
 
-* Databricks cluster with PySpark.
-* Valid `spark` session.
-* Databricks `display()` support.
+    Flow
+    ----
+    Bronze  ->  Silver  ->  Gold
 
-# 2. Execution & Validation
+    Bronze : Two customer DataFrames created with explicit schemas.
+    Silver : Records with age < 0 are removed.
+    Gold   : Both Silver DataFrames are combined with unionByName().
+    """
 
-Run the notebook/script in Databricks and verify these logs:
+    # ------------------------------------------------------------------
+    # Initialise
+    # ------------------------------------------------------------------
+    logger.info("Initializing Customer Demographics ETL Job...")
+    logger.info("Defining explicit schemas...")
 
-```text
-Initializing Customer Demographics ETL Job...
-Defining explicit schemas...
-Extracting data into Bronze layer...
-Filtering noisy data for Silver layer...
-Integrating Silver tables into Gold layer...
-Pipeline completed successfully.
-```
+    # ------------------------------------------------------------------
+    # Schema definitions
+    # 'name' MUST be StringType — the previous LongType/BIGINT declaration
+    # caused SparkNumberFormatException (CAST_INVALID_INPUT, SQLSTATE 22018)
+    # when Spark tried to cast string values like 'Alice' to BIGINT.
+    # ------------------------------------------------------------------
+    schema1 = StructType([
+        StructField("id",   LongType(),   True),
+        StructField("name", StringType(), True),   # FIX: was LongType() / BIGINT
+        StructField("age",  IntegerType(), True),
+    ])
 
-Expected Gold output:
+    schema2 = StructType([
+        StructField("id",   LongType(),   True),
+        StructField("age",  IntegerType(), True),
+        StructField("name", StringType(), True),   # FIX: was LongType() / BIGINT
+        # Note: different column ORDER from schema1 — handled by .select() in Silver
+    ])
 
-| id | name    | age |
-| -: | ------- | --: |
-|  1 | Alice   |  25 |
-|  3 | Charlie |  30 |
-|  4 | Dave    |  22 |
-|  6 | Eve     |  28 |
+    # ------------------------------------------------------------------
+    # Bronze layer
+    # ------------------------------------------------------------------
+    logger.info("Extracting data into Bronze layer...")
 
-`TestUser` and `BotAccount` are removed because their ages are negative.
+    data1 = [
+        (1, "Alice",      25),
+        (2, "TestUser",   -1),
+        (3, "Charlie",    30),
+    ]
 
-**Important:** The supplied script uses different column orders in the two DataFrames. Use `unionByName()` after selecting a consistent column order:
+    data2 = [
+        (4, 22,  "Dave"),
+        (5, -5,  "BotAccount"),
+        (6, 28,  "Eve"),
+    ]
 
-```python
-df1_silver = df1_bronze.filter("age >= 0").select("id", "name", "age")
-df2_silver = df2_bronze.filter("age >= 0").select("id", "name", "age")
+    df1_bronze = spark.createDataFrame(data1, schema=schema1)
+    df2_bronze = spark.createDataFrame(data2, schema=schema2)
 
-df_gold = df1_silver.unionByName(df2_silver)
-```
+    # ------------------------------------------------------------------
+    # Schema assertions — surface type errors immediately at definition
+    # time rather than during distributed task execution.
+    # ------------------------------------------------------------------
+    dtypes1 = dict(df1_bronze.dtypes)
+    dtypes2 = dict(df2_bronze.dtypes)
 
-# 3. Troubleshooting & Operations
+    assert dtypes1["name"] == "string", (
+        f"df1_bronze: 'name' column must be StringType, got {dtypes1['name']}"
+    )
+    assert dtypes2["name"] == "string", (
+        f"df2_bronze: 'name' column must be StringType, got {dtypes2['name']}"
+    )
 
-**If the job fails:**
+    # ------------------------------------------------------------------
+    # Silver layer — filter negative ages and normalise column order
+    # so that unionByName() can match columns by name regardless of the
+    # different column orders in the two Bronze schemas.
+    # ------------------------------------------------------------------
+    logger.info("Filtering noisy data for Silver layer...")
 
-1. Check the Databricks cell output and `CustomerDemographicsETL` logs.
-2. If the failure occurs at the Gold step, verify that both DataFrames have the same column names and types.
-3. Confirm `unionByName()` is being used.
-4. Re-run the notebook after correcting the issue.
+    df1_silver = df1_bronze.filter("age >= 0").select("id", "name", "age")
+    df2_silver = df2_bronze.filter("age >= 0").select("id", "name", "age")
 
-**Success criteria**
+    # ------------------------------------------------------------------
+    # Gold layer
+    # ------------------------------------------------------------------
+    logger.info("Integrating Silver tables into Gold layer...")
 
-* No unhandled exception.
-* Four valid customer records in Gold.
-* Negative-age records are excluded.
-* Final success log is generated.
+    df_gold = df1_silver.unionByName(df2_silver)
 
-**Operational note:** The current script uses hard-coded sample data. For production, replace these inputs with persistent Bronze sources and add data-quality, row-count, and monitoring checks.
+    # ------------------------------------------------------------------
+    # Row-count smoke-test
+    # ------------------------------------------------------------------
+    gold_count = df_gold.count()
+    assert gold_count == 4, (
+        f"Gold layer expected 4 records (ids 1, 3, 4, 6), got {gold_count}"
+    )
+
+    logger.info("Pipeline completed successfully.")
+
+    # ------------------------------------------------------------------
+    # Display results (Databricks-compatible; falls back to show() locally)
+    # ------------------------------------------------------------------
+    try:
+        display(df_gold)  # noqa: F821  — available in Databricks notebooks
+    except NameError:
+        df_gold.show()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+if __name__ == "__main__":
+    try:
+        run_pipeline()
+    except AssertionError as exc:
+        logger.error("Pipeline failed schema/count validation: %s", exc)
+        spark.stop()
+        raise
+    except Exception as exc:
+        logger.error("Pipeline failed during execution. Error details: %s", exc)
+        spark.stop()
+        raise
+    finally:
+        spark.stop()
