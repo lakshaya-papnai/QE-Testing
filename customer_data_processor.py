@@ -1,47 +1,68 @@
-from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, udf
-from pyspark.sql.types import StructType, StructField, StringType, FloatType
+# 1. Overview
 
+**Purpose:** Run and validate the Customer Demographics ETL in Databricks.
 
-risk_schema = StructType([
-    StructField("risk_label", StringType(), True),
-    StructField("risk_score", FloatType(), True),
-])
-@udf(returnType=risk_schema)
-def classify_risk(order_value):
-    if order_value is None:
-        return None
-    if order_value > 1000:
-        return ("HIGH", 0.9)   
-    elif order_value > 300:
-        return ("MEDIUM", 0.5)
-    else:
-        return ("LOW", 0.1)
+**Flow:**
+`Bronze → Silver → Gold`
 
+* **Bronze:** Creates two customer datasets with explicit schemas.
+* **Silver:** Removes records where `age < 0`.
+* **Gold:** Combines the cleaned datasets.
+* **Logging:** Tracks initialization, processing stages, success, and failures.
 
-def run_risk_classification(spark: SparkSession):
-    df = spark.createDataFrame([
-        (1, "order-A", 1500.0),
-        (2, "order-B", 450.0),
-        (3, "order-C", 80.0),
-    ], ["customer_id", "order_id", "order_value"])
+**Prerequisites**
 
-    df_classified = df.withColumn("risk", classify_risk(col("order_value")))
-    df_final = df_classified.select(
-        "customer_id", "order_id", "order_value",
-        col("risk.risk_label").alias("risk_label"),
-        col("risk.risk_score").alias("risk_score"),
-    )
+* Databricks cluster with PySpark.
+* Valid `spark` session.
+* Databricks `display()` support.
 
-    return df_final
+# 2. Execution & Validation
 
+Run the notebook/script in Databricks and verify these logs:
 
-if __name__ == "__main__":
-    spark = SparkSession.builder.appName("RiskClassificationPipeline").getOrCreate()
-    try:
-        result = run_risk_classification(spark)
-        result.show()
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        spark.stop()
+```text
+Initializing Customer Demographics ETL Job...
+Defining explicit schemas...
+Extracting data into Bronze layer...
+Filtering noisy data for Silver layer...
+Integrating Silver tables into Gold layer...
+Pipeline completed successfully.
+```
+
+Expected Gold output:
+
+| id | name    | age |
+| -: | ------- | --: |
+|  1 | Alice   |  25 |
+|  3 | Charlie |  30 |
+|  4 | Dave    |  22 |
+|  6 | Eve     |  28 |
+
+`TestUser` and `BotAccount` are removed because their ages are negative.
+
+**Important:** The supplied script uses different column orders in the two DataFrames. Use `unionByName()` after selecting a consistent column order:
+
+```python
+df1_silver = df1_bronze.filter("age >= 0").select("id", "name", "age")
+df2_silver = df2_bronze.filter("age >= 0").select("id", "name", "age")
+
+df_gold = df1_silver.unionByName(df2_silver)
+```
+
+# 3. Troubleshooting & Operations
+
+**If the job fails:**
+
+1. Check the Databricks cell output and `CustomerDemographicsETL` logs.
+2. If the failure occurs at the Gold step, verify that both DataFrames have the same column names and types.
+3. Confirm `unionByName()` is being used.
+4. Re-run the notebook after correcting the issue.
+
+**Success criteria**
+
+* No unhandled exception.
+* Four valid customer records in Gold.
+* Negative-age records are excluded.
+* Final success log is generated.
+
+**Operational note:** The current script uses hard-coded sample data. For production, replace these inputs with persistent Bronze sources and add data-quality, row-count, and monitoring checks.
